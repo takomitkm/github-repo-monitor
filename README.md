@@ -32,14 +32,17 @@ State is persisted to a local JSON file (`gh_monitor_state.json` by default);
 the cursor only moves forward, so re-runs never duplicate reports. Edit
 `MONITOR_REPOS` to choose what you watch.
 
-## Scheduled runs (GitHub Actions)
+## Manual runs (GitHub Actions)
 
-`.github/workflows/magpie-monitor.yml` runs the monitor on a daily cron
-(`0 22 * * *`, i.e. 06:00 Asia/Shanghai) and on `workflow_dispatch`. It runs
-`scripts/magpie_monitor.py` by default; switch the `run:` step to
-`scripts/gh_monitor.py` if you prefer the generic monitor. The workflow grants
-only `contents: read` and `issues: write`, and posts nothing unless posting is
-explicitly enabled — consistent with the zero-write-by-default design.
+`.github/workflows/magpie-monitor.yml` runs the monitor on demand via
+`workflow_dispatch` only — there is **no scheduled / daily cron** by default.
+Trigger it from the Actions tab, optionally passing a `since` ISO-8601 UTC
+cursor to rewind for a deep digest. To restore daily runs, add a `schedule`
+entry under `on:` in that workflow file. It runs `scripts/magpie_monitor.py`
+by default; switch the `run:` step to `scripts/gh_monitor.py` if you prefer the
+generic monitor. The workflow grants only `contents: read` and `issues: write`,
+and posts nothing unless posting is explicitly enabled — consistent with the
+zero-write-by-default design.
 
 ## License
 
