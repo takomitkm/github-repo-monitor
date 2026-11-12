@@ -1,11 +1,10 @@
 name: github-repo-monitor
 
-# Daily 06:00 Asia/Shanghai == 22:00 UTC (GitHub schedules in UTC; runs can
-# be delayed a few minutes under load). workflow_dispatch allows instant
-# manual runs and cursor rewinds for deep digests.
+# No scheduled runs — monitoring runs on demand only, via workflow_dispatch
+# (instant manual runs, with an optional `since` input to rewind the cursor
+# for a deep digest). This keeps the GitHub Actions deployment capability
+# without any automatic daily posting.
 on:
-  schedule:
-    - cron: "0 22 * * *"
   workflow_dispatch:
     inputs:
       since:
