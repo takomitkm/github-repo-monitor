@@ -1,4 +1,4 @@
-name: magpie-monitor
+name: github-repo-monitor
 
 # Daily 06:00 Asia/Shanghai == 22:00 UTC (GitHub schedules in UTC; runs can
 # be delayed a few minutes under load). workflow_dispatch allows instant
@@ -18,7 +18,7 @@ permissions:
   issues: write
 
 concurrency:
-  group: magpie-monitor
+  group: github-repo-monitor
   cancel-in-progress: false
 
 jobs:
@@ -26,10 +26,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Run magpie ecosystem monitor
+      - name: Run GitHub repo monitor
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          MAGPIE_MONITOR_REPO: mmqz/cpa-multi-plugins
+          MAGPIE_MONITOR_REPO: takomitkm/github-repo-monitor
           MAGPIE_MONITOR_STATE: issue
           MAGPIE_MONITOR_POST: "1"
         run: python3 scripts/magpie_monitor.py --since "${{ inputs.since }}"

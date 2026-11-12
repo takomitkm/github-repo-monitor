@@ -3,7 +3,7 @@
 gh_monitor.py — 参数化 GitHub 活动监控器（聚合 GitHub 信息，只采集分类，不发推送）
 
 融合自：
-  - magpie_monitor.py 骨架：增量游标采集(since) + seen 去重 + 三档分诊(alerts/contexts/errors)
+  - 早期增量采集骨架：增量游标采集(since) + seen 去重 + 三档分诊(alerts/contexts/errors)
     + 状态持久化(JSON 文件) + 自引导。
   - google/triage-party 特性：监控面参数化(任意 owner/repo + 子路径) + 过滤维度(keywords/labels/authors)。
 
