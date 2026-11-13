@@ -1,0 +1,68 @@
+name: github-repo-triage
+
+# Manual-only trigger. There is NO schedule — this runs on demand from the
+# Actions tab (Run workflow). This is the declarative, read-only triage engine
+# (scripts/gh_monitor.py), a local port of google/triage-party's
+# `collection -> rules -> filters` model.
+#
+# By DEFAULT it performs ZERO remote writes: only GET requests against the
+# GitHub REST API, plus (optionally) a local state file that is NOT committed
+# back, and the digest is printed to the job log. No issues are created, no
+# comments are posted, no branches are pushed. To restore a daily cadence,
+# add a `schedule:` entry under `on:` yourself.
+on:
+  workflow_dispatch:
+    inputs:
+      since:
+        description: "Cursor override (ISO 8601 UTC), e.g. 2026-10-01T00:00:00Z. Empty = continue from stored cursor."
+        required: false
+        default: ""
+      lookback-days:
+        description: "Days of history to scan when no stored cursor exists."
+        required: false
+        default: "7"
+      max-enrich:
+        description: "Max issues whose comments to fetch for responded/tag signals (0 = skip comment enrichment)."
+        required: false
+        default: "20"
+      dry-run:
+        description: "If true (default) do not write the local state file — pure read-only run."
+        required: false
+        default: "true"
+      save-report:
+        description: "If true, also write the digest to gh_report.md and upload it as a workflow artifact."
+        required: false
+        default: "false"
+
+permissions:
+  contents: read
+  actions: write   # only used when save-report=true (artifact upload)
+
+concurrency:
+  group: github-repo-triage
+  cancel-in-progress: false
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run declarative triage engine
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 scripts/gh_monitor.py \
+            --rules scripts/rules.yaml \
+            --lookback-days "${{ inputs.lookback-days }}" \
+            --max-enrich "${{ inputs.max-enrich }}" \
+            ${{ inputs.dry-run == 'true' && '--dry-run' || '' }} \
+            ${{ inputs.save-report == 'true' && '--report gh_report.md' || '' }} \
+            ${{ inputs.since != '' && format('--since {0}', inputs.since) || '' }}
+
+      - name: Upload digest as artifact
+        if: ${{ inputs.save-report == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: gh-triage-report
+          path: gh_report.md

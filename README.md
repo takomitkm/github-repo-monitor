@@ -9,11 +9,14 @@ local cron job, or your laptop) against only the public GitHub REST API.
 
 There are two monitor scripts:
 
-- `scripts/gh_monitor.py` — a generic, parameter-driven monitor. Point it at any
-  `owner/repo` (plus optional path / keyword / label / author filters) via the
-  `MONITOR_REPOS` config block near the top, and it aggregates the activity for
-  you. Pure stdlib, no dependencies, no GitHub token required (anonymous
-  60 req/hr covers small setups; a `GITHUB_TOKEN` raises the rate limit).
+- `scripts/gh_monitor.py` — a generic, **declarative rule-engine** monitor. It
+  aggregates issue / PR / release activity across the repos listed in
+  `scripts/rules.yaml`, classifies each item into ALERT / CONTEXT / ERROR tiers
+  with a `collection → rules → filters` model (a local port of
+  google/triage-party), and prints a Markdown digest. Pure stdlib, no
+  dependencies, zero remote writes by default (a `GITHUB_TOKEN` just raises the
+  rate limit). See `scripts/TRIAGE.md` for the full rule syntax and the seven
+  ported dimensions.
 - `scripts/magpie_monitor.py` — a focused monitor for the Magpie ecosystem
   (`yetone/magpie` + `magpie-community/plugins`) using the same cursor /
   de-duplication / triage model, with an optional tracking-issue state backend.
@@ -30,7 +33,7 @@ python scripts/gh_monitor.py --report gh_report.md          # also write the rep
 
 State is persisted to a local JSON file (`gh_monitor_state.json` by default);
 the cursor only moves forward, so re-runs never duplicate reports. Edit
-`MONITOR_REPOS` to choose what you watch.
+`scripts/rules.yaml` to choose what you watch.
 
 ## Manual runs (GitHub Actions)
 
@@ -43,6 +46,11 @@ by default; switch the `run:` step to `scripts/gh_monitor.py` if you prefer the
 generic monitor. The workflow grants only `contents: read` and `issues: write`,
 and posts nothing unless posting is explicitly enabled — consistent with the
 zero-write-by-default design.
+
+`.github/workflows/gh-triage.yml` is a **separate, read-only** workflow for the
+declarative `gh_monitor.py` engine — also `workflow_dispatch` only, granting
+only `contents: read` (plus `actions: write` solely for an optional report
+artifact). It performs zero remote writes by default. See `scripts/TRIAGE.md`.
 
 ## License
 

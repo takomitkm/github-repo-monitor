@@ -1,0 +1,127 @@
+# github-repo-monitor / rules.yaml
+# ---------------------------------------------------------------------------
+# 声明式分诊规则（移植自 google/triage-party 的 collection -> rules -> filters
+# 三层模型，见 https://github.com/google/triage-party/blob/master/docs/config.md）
+#
+# 由纯标准库解析器 scripts/miniyaml.py 读取，零第三方依赖。
+# 支持的 YAML 子集：嵌套映射、序列（含 - key: value 形式）、行内列表
+# [a, b]、字符串/整数/浮点/布尔、整行或行尾 # 注释。请用空格缩进。
+#
+# ---------------------------------------------------------------------------
+# 顶层结构
+#   settings     全局参数（相似度阈值、成员、API 地址、未命中兜底）
+#   repos        要盯的仓库（多仓库聚合，等价于旧的 MONITOR_REPOS）
+#   rules        命名规则；一条规则内所有 filters 是 AND；规则之间是 OR
+#   collections  集合；引用若干 rule，用 resolution 决定归入哪一档
+# ---------------------------------------------------------------------------
+
+settings:
+  name: github-repo-monitor
+  # 标题相似度 >= 该值时打 [similar] 标记；0 关闭。纯标准库 difflib 实现。
+  min_similarity: 0.75
+  # true 时把相似簇折叠成一条（可能丢信息），默认只标记不折叠。
+  dedup_similar: false
+  # 没有任何规则命中时的兜底档位：alert | context | ignore
+  unmatched: context
+  # 硬编码的项目成员登录名（小写），用于 send/recv/recv-q 方向判断。
+  members: []
+  # 另外把哪些 author_association 视为成员。
+  member_roles: [OWNER, MEMBER, COLLABORATOR]
+  # GitHub Enterprise 用 --api-url 覆盖；会自动补 /api/v3。
+  github_api_url: https://api.github.com
+  # 过滤器里未写 state 时的默认值。triage-party 默认 open，这里默认 all
+  # 是为了让 commit / release 这类没有 open/closed 状态的对象也能被采集。
+  state: all
+
+# ---------------------------------------------------------------------------
+# 多仓库 / 跨项目聚合：照抄旧 MONITOR_REPOS 的字段，可继续加仓库。
+# ---------------------------------------------------------------------------
+repos:
+  - repo: google/leveldb
+    note: "示例：Google LevelDB（改成你要盯的仓库即可）"
+    watch_commits: true
+    watch_issues: true
+    watch_releases: true
+    paths: []
+    authors: []
+    labels: []
+
+# ---------------------------------------------------------------------------
+# 集合：报告里的 ALERTS / Context 两档由此而来。
+# resolution: alert | context | ignore
+# ---------------------------------------------------------------------------
+collections:
+  - id: alerts
+    name: 需要立刻处理
+    resolution: alert
+    rules: [security, breaking, release, hot]
+    dedup: false
+  - id: context
+    name: 了解即可
+    resolution: context
+    rules: [perf]
+    dedup: false
+
+# ---------------------------------------------------------------------------
+# 规则：filters 是 AND。表达式语法：
+#   label / title / body / tag / repo / type / author / path / milestone
+#       -> 正则，前缀 ! 取反（例 "!wontfix"）
+#   state -> open | closed | all
+#   created / updated / responded / prioritized / max-age / stale
+#       -> [-+]时长或比较式：+30d(至少30天) -7d(7天内) >=5 <2w 1mo
+#          单位 d/w/mo/y/h/m 可省略(按天)。responded/prioritized 需要评论数据。
+#   reactions / comments / commenters / reactions-per-month /
+#   comments-per-month / commenters-per-month / comments-while-closed /
+#   commenters-while-closed
+#       -> [><=]数值，例 ">=5"、">1.5"；无前缀 = 至少
+# ---------------------------------------------------------------------------
+rules:
+  security:
+    name: 安全相关
+    filters:
+      - title: "CVE|security|RCE|vulnerab|0day|exploit"
+      - label: "!wontfix"
+  breaking:
+    name: 破坏性变更
+    filters:
+      - title: "breaking|incompatible|deprecat|remove API|BREAKING CHANGE"
+  release:
+    name: 新版本发布
+    filters:
+      - type: release
+  hot:
+    name: 社区高热
+    filters:
+      - reactions: ">=5"
+      - created: "-90d"
+  perf:
+    name: 性能相关
+    filters:
+      - title: "benchmark|compaction|performance|latency|throughput"
+
+# ---------------------------------------------------------------------------
+# 可选配方（默认注释掉，取消注释即启用）。这些会触发「有界评论拉取」：
+# 只对通过廉价过滤器的候选 issue 拉评论，最多 --max-deep 条（默认 20），
+# 用于计算 responded / tag: recv|send|recv-q|member-last|author-last 等。
+# ---------------------------------------------------------------------------
+#  stale:
+#    name: 长期无人回应
+#    filters:
+#      - state: open
+#      - responded: +60d
+#      - tag: "!wontfix"
+#  needs-reply:
+#    name: 等待我方回复
+#    filters:
+#      - tag: "recv|recv-q"
+#  old-unanswered:
+#    name: 陈旧未响应
+#    filters:
+#      - created: +30d
+#      - comments: ">=3"
+#      - tag: "!commented"
+#  collections:
+#    - id: alerts
+#      name: 需要立刻处理
+#      resolution: alert
+#      rules: [security, breaking, release, hot, needs-reply, stale]
