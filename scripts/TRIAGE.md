@@ -79,13 +79,14 @@ collections:
 
 | 字段 | 说明 |
 |------|------|
-| `repo` | 仓库 `owner/repo` |
+| `repo` | 仓库 `owner/repo`（collection 级 `repos` 可进一步限定） |
 | `author` | 作者登录名 |
+| `assignee` | 被指派人登录名（对应 tag `assigned`） |
 | `label` / `!label` | issue/PR 标签（标签列表为空时 `!label` 仍成立） |
 | `title` / `body` / `milestone` | 文案 |
 | `path` | 变更路径（PR） |
 | `type` | `issue` / `pr` / `release` |
-| `tag` | `send` / `recv` / `recv-q` / `member-last` / `author-last` / `commented`（对话方向） |
+| `tag` | 见下方「tag 取值」 |
 
 **时间窗（单位天；`+` 更老、`-` 更新）**
 
@@ -108,6 +109,29 @@ collections:
 `*-per-month` 用 `months_since = 天数 / 30.4375`（下限 0.03）做归一化。
 
 **近重复**：`min_similarity: 0.85`（0–1）。
+
+### tag 取值
+
+| 分组 | tag |
+|------|-----|
+| 对话方向（需评论拉取） | `send` `recv` `recv-q` `member-last` `author-last` `commented` |
+| 事务 / 元数据 | `assigned` `assignee-updated` `open-milestone` `closed` `merged` `draft` `similar` |
+| PR 评审（需评审拉取） | `approved` `changes-requested` `reviewed-with-comment` `new-commits` `unreviewed` `pushed-after-approval` |
+
+`!tag` 取反。PR 评审标签同时以 `pr-` 前缀挂到其关联 issue 上（如 `pr-approved`）。
+
+### B 类增强：PR 评审 / 指派人 / 集合级作用域
+
+- **PR 评审标签**：仅对候选 PR（按更新时间降序、最多 `--max-enrich` 条）拉
+  `GET /repos/{repo}/pulls/{n}/reviews`（必要时再拉 `.../commits`）。按**最后一次评审**
+  判定 `approved` / `changes-requested` / `reviewed-with-comment`；无评审 ⇒ `unreviewed`；
+  最后评审之后又有提交 ⇒ `new-commits`；通过后又推送 ⇒ `pushed-after-approval`。
+  只在规则真正用到这些标签时才触发评审拉取（`_needs_reviews`）。
+- **`assignee` 过滤 / `assignee-updated`**：按被指派人登录名正则匹配；
+  `assignee-updated` 表示“最后一条评论来自该 issue 的指派人”。
+- **`open-milestone`**：issue 属于一个 **open** 里程碑（读 `milestone.state`）。
+- **collection 级作用域**：集合可选 `repos: [owner/repo]` 只从这些仓库取条目；
+  可选 `category`（层级分类）与 `description`（人类可读说明）。
 
 ---
 
@@ -138,6 +162,13 @@ python3 scripts/gh_monitor.py --api-url https://ghe.example.com/api/v3
 
 # 零网络自测（解析 + 引擎）
 python3 scripts/gh_monitor.py --self-test
+
+# 只校验配置（零网络，不采集）
+python3 scripts/gh_monitor.py --validate
+
+# 生成一份 rules.yaml 模板（已存在时用 --force 覆盖）
+python3 scripts/gh_monitor.py --init
+python3 scripts/gh_monitor.py --init --force
 ```
 
 环境变量：`GITHUB_TOKEN`（未设则匿名、速率受限）；`GITHUB_API_URL`（GHE）。
@@ -165,5 +196,6 @@ python3 scripts/gh_monitor.py --self-test
 - **零第三方依赖**：内置 `miniyaml.py` 解析 YAML 子集，避免引入 PyYAML。
 - **零远程写**：唯一网络调用是 `GET`；唯一本地写是 state 文件（可被 `--dry-run` 跳过）。
 - **游标只前进**：`state` 记录 `cursor` 与去重集合，重跑不重复报告。
-- **有界评论拉取**：`--max-enrich` 限制最多拉取 N 条 issue/PR 的评论（按更新时间降序），
-  用于 `responded` / 对话方向 / `commenters` 信号，控制速率与配额。
+- **有界拉取**：`--max-enrich` 限制最多拉取 N 条 issue/PR 的评论与 PR 评审（按更新时间降序），
+  用于 `responded` / 对话方向 / `commenters` / PR 评审标签；只有规则用到相关信号时才触发，
+  以控制速率与配额。

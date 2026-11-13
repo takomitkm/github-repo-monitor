@@ -15,8 +15,10 @@ There are two monitor scripts:
   with a `collection → rules → filters` model (a local port of
   google/triage-party), and prints a Markdown digest. Pure stdlib, no
   dependencies, zero remote writes by default (a `GITHUB_TOKEN` just raises the
-  rate limit). See `scripts/TRIAGE.md` for the full rule syntax and the seven
-  ported dimensions.
+  rate limit). It also derives PR-review tags (`approved` / `changes-requested` /
+  `new-commits` / `unreviewed` / `pushed-after-approval`), supports `assignee`
+  filtering, and per-collection repo scoping. See `scripts/TRIAGE.md` for the full
+  rule syntax and the seven ported dimensions.
 - `scripts/magpie_monitor.py` — a focused monitor for the Magpie ecosystem
   (`yetone/magpie` + `magpie-community/plugins`) using the same cursor /
   de-duplication / triage model, with an optional tracking-issue state backend.
@@ -29,6 +31,9 @@ python scripts/gh_monitor.py --since 2026-11-01T00:00:00Z   # rewind and replay 
 python scripts/gh_monitor.py --lookback-days 14            # first run: look back 14 days
 python scripts/gh_monitor.py --dry-run                     # report only, don't advance cursor
 python scripts/gh_monitor.py --report gh_report.md          # also write the report to a file
+python scripts/gh_monitor.py --self-test                     # zero-network parser + engine self-test
+python scripts/gh_monitor.py --validate                      # zero-network static check of rules.yaml
+python scripts/gh_monitor.py --init                          # scaffold a starter rules.yaml
 ```
 
 State is persisted to a local JSON file (`gh_monitor_state.json` by default);

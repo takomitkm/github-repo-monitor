@@ -53,19 +53,23 @@ repos:
 collections:
   - id: alerts
     name: 需要立刻处理
+    description: "安全 / 破坏性变更 / 发布 / 高热，需要尽快看"
     resolution: alert
     rules: [security, breaking, release, hot]
     dedup: false
   - id: context
     name: 了解即可
+    category: background
+    description: "性能等背景信息，不紧急"
     resolution: context
     rules: [perf]
     dedup: false
+    # repos: [google/leveldb]   # 可选：该集合只从这些仓库取条目（覆盖顶层 repos）
 
 # ---------------------------------------------------------------------------
 # 规则：filters 是 AND。表达式语法：
-#   label / title / body / tag / repo / type / author / path / milestone
-#       -> 正则，前缀 ! 取反（例 "!wontfix"）
+#   label / title / body / tag / repo / type / author / assignee / path / milestone
+#       -> 正则，前缀 ! 取反（例 "!wontfix"）；assignee 匹配被指派人登录名
 #   state -> open | closed | all
 #   created / updated / responded / prioritized / max-age / stale
 #       -> [-+]时长或比较式：+30d(至少30天) -7d(7天内) >=5 <2w 1mo
@@ -74,6 +78,13 @@ collections:
 #   comments-per-month / commenters-per-month / comments-while-closed /
 #   commenters-while-closed
 #       -> [><=]数值，例 ">=5"、">1.5"；无前缀 = 至少
+# ---------------------------------------------------------------------------
+# tag 取值（写进 filters 的 tag，前缀 ! 取反）：
+#   对话方向（需评论数据）：commented send recv recv-q member-last author-last
+#   其他：assigned assignee-updated open-milestone closed merged draft similar
+#   PR 评审（需评审数据）：approved changes-requested reviewed-with-comment
+#                       new-commits unreviewed pushed-after-approval
+#   （PR 评审标签也会带 pr- 前缀挂到其关联 issue 上，如 pr-approved）
 # ---------------------------------------------------------------------------
 rules:
   security:
@@ -100,9 +111,11 @@ rules:
       - title: "benchmark|compaction|performance|latency|throughput"
 
 # ---------------------------------------------------------------------------
-# 可选配方（默认注释掉，取消注释即启用）。这些会触发「有界评论拉取」：
-# 只对通过廉价过滤器的候选 issue 拉评论，最多 --max-deep 条（默认 20），
-# 用于计算 responded / tag: recv|send|recv-q|member-last|author-last 等。
+# 可选配方（默认注释掉，取消注释即启用）。这些会触发「有界拉取」：
+#   评论类 -> 只对通过廉价过滤器的候选 issue 拉评论，最多 --max-enrich 条（默认 20），
+#            用于计算 responded / tag: recv|send|recv-q|member-last|assignee-updated 等。
+#   评审类 -> 只对候选 PR 拉 reviews（必要时再拉 commits），用于 approved/
+#            changes-requested/unreviewed/new-commits/pushed-after-approval。
 # ---------------------------------------------------------------------------
 #  stale:
 #    name: 长期无人回应
@@ -120,6 +133,18 @@ rules:
 #      - created: +30d
 #      - comments: ">=3"
 #      - tag: "!commented"
+#  needs-review:
+#    name: 等待评审
+#    filters:
+#      - tag: "unreviewed|changes-requested"
+#  pushed-after-approval:
+#    name: 通过后又有推送
+#    filters:
+#      - tag: "pushed-after-approval"
+#  my-assigned:
+#    name: 分配给我的人
+#    filters:
+#      - assignee: "alice|bob"
 #  collections:
 #    - id: alerts
 #      name: 需要立刻处理

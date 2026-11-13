@@ -252,25 +252,51 @@ def load_rules(path):
     for rname in cfg["rules"]:
         r = cfg["rules"][rname]
         rule_tier[rname] = (r.get("tier") or "context")
+    # 规则 -> 允许的仓库集合（collection 级 repos 覆盖；None = 不限仓库，取任一 collection 无 repos 即不限）
+    rule_repos = {}
+    collections_meta = []
     for c in cfg["collections"]:
         # triage-party 用 `resolution` 决定集合档位；内嵌 DEFAULT_RULES 旧式用 `tier`
         ctier = c.get("resolution") or c.get("tier") or "context"
+        crepos = c.get("repos")
+        crepos_set = set(crepos) if crepos else None
+        collections_meta.append({
+            "id": c.get("id"),
+            "name": c.get("name") or c.get("id"),
+            "category": c.get("category"),
+            "description": c.get("description"),
+            "resolution": ctier,
+            "repos": list(crepos) if crepos else None,
+        })
         for rn in (c.get("rules") or []):
             if rn in rule_tier:
                 if TIER_PRIORITY.get(ctier, 9) < TIER_PRIORITY.get(rule_tier[rn], 9):
                     rule_tier[rn] = ctier
+            if crepos_set is None:
+                rule_repos[rn] = None
+            elif rule_repos.get(rn) is None and rn in rule_repos:
+                pass  # 已被无 repos 的 collection 放开，保持不限
+            else:
+                rule_repos[rn] = (rule_repos.get(rn) or set()) | crepos_set
     cfg["_rule_tier"] = rule_tier
+    cfg["_rule_repos"] = rule_repos
+    cfg["_collections"] = collections_meta
     cfg["_members"] = set(m.lower() for m in (settings.get("members") or []))
     cfg["_roles"] = set(str(r).upper() for r in (settings.get("member_roles") or []))
-    # 需要评论数据的过滤器（触发有界拉取）
+    # 需要评论 / 评审数据的过滤器（触发有界拉取）
     cfg["_needs_deep"] = _needs_deep(cfg)
+    cfg["_needs_reviews"] = _needs_reviews(cfg)
     return cfg
 
 
 _DEEP_KEYS = {
     "responded", "commenters", "comments-while-closed", "commenters-while-closed",
 }
-_DEEP_TAGS = {"recv", "recv-q", "send", "member-last", "author-last", "commented"}
+_DEEP_TAGS = {"recv", "recv-q", "send", "member-last", "author-last", "commented",
+              "assignee-updated"}
+# PR 评审状态标签（由有界 review 拉取推导，见 enrich_pr_reviews）
+_REVIEW_TAGS = {"approved", "changes-requested", "reviewed-with-comment",
+                "new-commits", "unreviewed", "pushed-after-approval"}
 
 
 def _needs_deep(cfg):
@@ -280,6 +306,16 @@ def _needs_deep(cfg):
                 if k in _DEEP_KEYS:
                     return True
                 if k == "tag" and re.search(r"[!]?(" + "|".join(_DEEP_TAGS) + r")\b", str(v)):
+                    return True
+    return False
+
+
+def _needs_reviews(cfg):
+    """任一规则引用了 PR 评审标签时才触发有界 review 拉取。"""
+    for r in cfg["rules"].values():
+        for flt in (r.get("filters") or []):
+            for k, v in flt.items():
+                if k == "tag" and re.search(r"[!]?(" + "|".join(_REVIEW_TAGS) + r")\b", str(v)):
                     return True
     return False
 
@@ -298,12 +334,12 @@ def _item_base(repo):
         "title": "", "body": "", "url": "",
         "author_login": "", "author_name": "", "author_association": "",
         "created": None, "updated": None,
-        "state": "all", "labels": [], "milestone": None,
+        "state": "all", "labels": [], "milestone": None, "milestone_state": None,
         "reactions": 0, "comments": 0, "commenters": 0,
         "assignees": [], "is_pr": False, "is_draft": False, "merged": False,
         "path": None, "comments_url": None, "closed_at": None,
         "tags": set(), "responded_last_team": None, "similar_to": None,
-        "comment_data": None,
+        "comment_data": None, "reviews": None, "last_commit_at": None,
     }
 
 
@@ -376,6 +412,7 @@ def fetch_issues(repo, since_dt, labels, authors):
                 created=parse_iso(it.get("created_at")), updated=upd,
                 state=it.get("state", "all"), labels=_norm_labels(it),
                 milestone=(it.get("milestone") or {}).get("title"),
+                milestone_state=(it.get("milestone") or {}).get("state"),
                 reactions=(it.get("reactions") or {}).get("total_count", 0),
                 comments=it.get("comments", 0),
                 assignees=[a.get("login") for a in (it.get("assignees") or [])],
@@ -393,6 +430,8 @@ def fetch_issues(repo, since_dt, labels, authors):
                 obj["tags"].add("merged")
             if obj["milestone"]:
                 obj["tags"].add("milestone")
+            if obj["milestone"] and obj["milestone_state"] == "open":
+                obj["tags"].add("open-milestone")
             if obj["assignees"]:
                 obj["tags"].add("assigned")
             if labels and not (set(obj["labels"]) & set(labels)):
@@ -481,8 +520,77 @@ def enrich_comments(objs, cfg, max_deep):
                 o["tags"].add("recv")
                 if "?" in lbody:
                     o["tags"].add("recv-q")
+            # 由 assignee 更新：最后评论者属于该 issue/PR 的 assignees
+            if llogin and llogin in (o.get("assignees") or []):
+                o["tags"].add("assignee-updated")
         elif team_last is not None:
             o["tags"].add("send")
+
+
+def enrich_pr_reviews(objs, cfg, max_deep):
+    """只对 PR 拉评审（必要时再拉提交），最多 max_deep 条（按 updated 降序）。
+
+    语义对齐 triage-party config.md 的 Tags 一节：
+      - approved / changes-requested / reviewed-with-comment：按「最后一次评审」判定；
+      - new-commits：最后评审之后又有新提交；
+      - unreviewed：从未评审；
+      - pushed-after-approval：通过评审之后又推送了提交。
+    纯 REST（/pulls/{n}/reviews、/pulls/{n}/commits），不需要 GraphQL。
+    """
+    if not max_deep or max_deep <= 0:
+        return
+    prs = sorted([o for o in objs if o["kind"] == "pr" and o.get("number") is not None],
+                 key=lambda o: o["updated"] or utcnow(), reverse=True)[:max_deep]
+    need_commits = False
+    for r in cfg["rules"].values():
+        for flt in (r.get("filters") or []):
+            for k, v in flt.items():
+                if k == "tag" and re.search(r"[!]?(new-commits|pushed-after-approval)\b", str(v)):
+                    need_commits = True
+    for o in prs:
+        try:
+            reviews = gh_get("/repos/%s/pulls/%s/reviews" % (o["repo"], o["number"]),
+                             {"per_page": 100})
+        except FetchError:
+            reviews = []
+        reviews = [r for r in (reviews or [])
+                   if str(r.get("state", "")).upper() in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED")
+                   and r.get("submitted_at")]
+        o["reviews"] = reviews
+        if not reviews:
+            o["tags"].add("unreviewed")
+            continue
+        reviews.sort(key=lambda r: parse_iso(r.get("submitted_at")) or utcnow())
+        last = reviews[-1]
+        st = str(last.get("state", "")).upper()
+        if st == "APPROVED":
+            o["tags"].add("approved")
+        elif st == "CHANGES_REQUESTED":
+            o["tags"].add("changes-requested")
+        elif st == "COMMENTED":
+            o["tags"].add("reviewed-with-comment")
+        if not need_commits:
+            continue
+        try:
+            commits = gh_get("/repos/%s/pulls/%s/commits" % (o["repo"], o["number"]),
+                             {"per_page": 100})
+        except FetchError:
+            commits = []
+        cdates = [parse_iso((c.get("commit") or {}).get("author", {}).get("date"))
+                  for c in (commits or [])]
+        cdates = [d for d in cdates if d]
+        last_commit = max(cdates) if cdates else None
+        if last_commit is None:
+            continue
+        o["last_commit_at"] = last_commit
+        last_review_dt = parse_iso(last.get("submitted_at"))
+        if last_review_dt and last_commit > last_review_dt:
+            o["tags"].add("new-commits")
+        appr_dts = [parse_iso(r.get("submitted_at")) for r in reviews
+                    if str(r.get("state", "")).upper() == "APPROVED"]
+        appr_dts = [d for d in appr_dts if d]
+        if appr_dts and last_commit > max(appr_dts):
+            o["tags"].add("pushed-after-approval")
 
 
 # ---------------------------------------------------------------------------
@@ -553,6 +661,8 @@ def match_filter(o, key, raw):
         return _regex_pass(raw, [o["repo"] or ""])
     if key == "author":
         return _regex_pass(raw, [o["author_login"] or "", o["author_name"] or ""])
+    if key == "assignee":
+        return _regex_pass(raw, o["assignees"] or [])
     if key == "path":
         return _regex_pass(raw, [o["path"] or ""]) if o["path"] else False
     if key == "type":
@@ -631,6 +741,9 @@ def rule_matches(o, rule):
 def classify(o, cfg):
     matched = []
     for rname, rule in cfg["rules"].items():
+        allowed = cfg.get("_rule_repos", {}).get(rname)
+        if allowed is not None and o.get("repo") not in allowed:
+            continue
         if rule_matches(o, rule):
             matched.append(rname)
     if not matched:
@@ -705,6 +818,9 @@ def gather(cfg, cursor_dt, lookback_days, max_deep, no_enrich):
     # 有界评论拉取
     if cfg["_needs_deep"] and not no_enrich:
         enrich_comments(objs, cfg, max_deep)
+    # 有界 PR 评审拉取
+    if cfg.get("_needs_reviews") and not no_enrich:
+        enrich_pr_reviews(objs, cfg, max_deep)
     mark_similar(objs, cfg)
     # 分诊
     by_tier = {"alert": [], "context": [], "error": []}
@@ -744,7 +860,7 @@ def _line(o):
         heat.append("👥%d" % o["commenters"])
     if heat:
         parts.append(" " + " ".join(heat))
-    dir_tags = [t for t in o["tags"] if t in _DEEP_TAGS | {"similar", "assigned", "milestone", "closed", "merged", "draft"}]
+    dir_tags = [t for t in o["tags"] if t in _DEEP_TAGS | _REVIEW_TAGS | {"similar", "assigned", "milestone", "open-milestone", "closed", "merged", "draft"}]
     if dir_tags:
         parts.append(" · " + " ".join("`%s`" % t for t in dir_tags))
     if o["similar_to"]:
@@ -758,6 +874,10 @@ def build_report(now, cursor_dt, by_tier, errors, cfg, enriched):
     lines = ["# github-repo-monitor — %s" % cst(now), ""]
     lines.append("> cursor: %s · api: `%s` · enriched: %d · 仅采集分诊，零远程写入" %
                  (cst(cursor_dt) if cursor_dt else "首次", API, enriched))
+    lines.append("")
+    lines.append("> 标签：`send/recv/recv-q/member-last/author-last/commented` 对话方向 · "
+                 "`approved/changes-requested/reviewed-with-comment/new-commits/unreviewed/pushed-after-approval` PR 评审 · "
+                 "`assigned/assignee-updated/open-milestone/similar` 元数据")
     lines.append("")
     counts = {t: len(by_tier.get(t, [])) for t in ("alert", "context", "error")}
     sections = [("ALERTS", "alert"), ("CONTEXT", "context"), ("ERRORS (fetch)", "error")]
@@ -884,6 +1004,70 @@ def _selftest(cfg):
     assert match_filter(mk(title="x", labels=[]), "label", "!wontfix") is True
     assert match_filter(mk(title="x", labels=["wontfix"]), "label", "!wontfix") is False
 
+    # assignee 过滤（B 类新增字段）
+    oa = mk(title="assigned thing", assignees=["alice"])
+    assert match_filter(oa, "assignee", "alice") is True
+    assert match_filter(oa, "assignee", "bob") is False
+    assert match_filter(oa, "assignee", "!bob") is True
+
+    # open-milestone 标签
+    om = mk(title="m", milestone="v1", milestone_state="open")
+    om["tags"].add("open-milestone")
+    assert match_filter(om, "tag", "open-milestone") is True
+
+    # 拉取触发判定（新标签）
+    assert "assignee-updated" in _DEEP_TAGS
+    assert _needs_reviews({"rules": {"x": {"filters": [{"tag": "approved"}]}}}) is True
+    assert _needs_reviews({"rules": {"x": {"filters": [{"title": "y"}]}}}) is False
+
+    # PR 评审状态标签（合成 gh_get，零网络）
+    _orig_get = globals()["gh_get"]
+
+    def _fake_get(path, params=None):
+        if "/reviews" in path:
+            if "/pulls/1/" in path:
+                return [{"state": "APPROVED", "submitted_at": iso(now - timedelta(days=2)),
+                         "user": {"login": "rev"}}]
+            if "/pulls/2/" in path:
+                return [{"state": "CHANGES_REQUESTED", "submitted_at": iso(now - timedelta(days=1)),
+                         "user": {"login": "rev"}}]
+            return []
+        if "/commits" in path:
+            return [{"commit": {"author": {"date": iso(now - timedelta(days=3))}}}]
+        return []
+
+    rcfg = dict(tcfg)
+    rcfg["rules"] = {
+        "needs-review": {"name": "待评审", "filters": [{"tag": "changes-requested"}]},
+        "approved": {"name": "已通过", "filters": [{"tag": "approved"}]},
+        "unreviewed": {"name": "未评审", "filters": [{"tag": "unreviewed"}]},
+    }
+    rcfg["_rule_tier"] = {"needs-review": "alert", "approved": "context", "unreviewed": "context"}
+    p1 = mk(title="pr one", kind="pr", number=1)
+    p2 = mk(title="pr two", kind="pr", number=2)
+    p3 = mk(title="pr three", kind="pr", number=3)
+    try:
+        globals()["gh_get"] = _fake_get
+        enrich_pr_reviews([p1, p2, p3], rcfg, 10)
+    finally:
+        globals()["gh_get"] = _orig_get
+    assert "approved" in p1["tags"], p1["tags"]
+    assert "changes-requested" in p2["tags"], p2["tags"]
+    assert "unreviewed" in p3["tags"], p3["tags"]
+    _rp = classify(p2, rcfg)
+    assert _rp and "needs-review" in _rp["rules"], _rp
+    assert _rp["tier"] == "alert"
+
+    # collection 级 repos 作用域：security 仅限 google/other
+    scfg = dict(tcfg)
+    scfg["_rule_repos"] = {"security": {"google/other"}}
+    _ro = classify(mk(title="CVE security", reactions=10), scfg)
+    assert "security" not in ((_ro or {}).get("rules") or []), "security 应被 repos 作用域排除"
+
+    # 配置校验（本地、无网络）
+    _verrs, _vwarns = validate_config(tcfg, None)
+    assert not _verrs, "validate 不应报错：%s" % (_verrs,)
+
     print("self-test:", "OK" if ok else "FAILED")
     return 0 if ok else 1
 
@@ -891,6 +1075,173 @@ def _selftest(cfg):
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
+_KNOWN_FILTER_KEYS = {
+    "label", "title", "body", "tag", "milestone", "repo", "author",
+    "assignee", "path", "type", "author-type", "state",
+    "created", "updated", "responded", "prioritized", "max-age", "stale",
+    "reactions", "comments", "commenters", "reactions-per-month",
+    "comments-per-month", "commenters-per-month",
+    "comments-while-closed", "commenters-while-closed", "min_similarity",
+}
+_KNOWN_TAGS = _DEEP_TAGS | _REVIEW_TAGS | {
+    "pr", "issue", "release", "commit", "assigned", "milestone",
+    "open-milestone", "closed", "merged", "draft", "similar",
+}
+
+
+def validate_config(cfg, rules_path):
+    """静态校验已加载的配置；返回 (errors, warnings) 两个字符串列表。纯本地、零网络。"""
+    errors = []
+    warnings = []
+    if not (rules_path and os.path.isfile(rules_path)):
+        warnings.append("rules 文件不存在，使用内置 DEFAULT_RULES：%s" % rules_path)
+    repos = cfg.get("repos") or []
+    repo_names = [rp.get("repo") for rp in repos if isinstance(rp, dict) and rp.get("repo")]
+    if not repo_names:
+        errors.append("repos 为空：至少要有一个 `- repo: owner/name`")
+    for i, rp in enumerate(repos):
+        if not isinstance(rp, dict) or not rp.get("repo"):
+            errors.append("repos[%d] 缺少 `repo:` 字段" % i)
+    rules = cfg.get("rules") or {}
+    if not rules:
+        errors.append("rules 为空：至少定义一条规则")
+    for rname, r in rules.items():
+        flts = r.get("filters")
+        if not flts:
+            warnings.append("规则 %s 没有 filters（永不命中）" % rname)
+            continue
+        for j, flt in enumerate(flts):
+            if not isinstance(flt, dict):
+                errors.append("规则 %s 的 filters[%d] 不是字典" % (rname, j))
+                continue
+            for k, v in flt.items():
+                lk = k.strip().lower()
+                if lk not in _KNOWN_FILTER_KEYS:
+                    errors.append("规则 %s 引用了未知过滤键 `%s`" % (rname, k))
+                elif lk == "min_similarity":
+                    try:
+                        fv = float(v)
+                        if not (0.0 <= fv <= 1.0):
+                            errors.append("规则 %s 的 min_similarity 超出 0..1：%s" % (rname, v))
+                    except (TypeError, ValueError):
+                        errors.append("规则 %s 的 min_similarity 非数值：%s" % (rname, v))
+                elif lk in ("created", "updated", "responded", "prioritized", "max-age", "stale"):
+                    if not parse_duration(v):
+                        errors.append("规则 %s 的时间表达式无效：%s=%s" % (rname, k, v))
+                elif lk in ("reactions", "comments", "commenters", "reactions-per-month",
+                            "comments-per-month", "commenters-per-month",
+                            "comments-while-closed", "commenters-while-closed"):
+                    if not parse_num(v):
+                        errors.append("规则 %s 的数值表达式无效：%s=%s" % (rname, k, v))
+                elif lk == "tag":
+                    for tok in re.split(r"[|,\s]+", str(v)):
+                        tok = tok.lstrip("!").strip()
+                        if tok and tok not in _KNOWN_TAGS:
+                            warnings.append("规则 %s 的 tag `%s` 不在已知标签集合（可能是自由标签）" % (rname, tok))
+    cols = cfg.get("collections") or []
+    if not cols:
+        errors.append("collections 为空：至少要有一个集合")
+    seen_ids = set()
+    used_rules = set()
+    for i, c in enumerate(cols):
+        cid = c.get("id")
+        if not cid:
+            errors.append("collections[%d] 缺少 `id:`" % i)
+        elif cid in seen_ids:
+            errors.append("collections 存在重复 id：%s" % cid)
+        if cid:
+            seen_ids.add(cid)
+        ctr = (c.get("resolution") or c.get("tier") or "").lower()
+        if ctr and ctr not in ("alert", "context", "quiet", "ignore"):
+            warnings.append("collection %s 的 resolution 不常见：%s" % (cid, ctr))
+        for rn in (c.get("rules") or []):
+            used_rules.add(rn)
+            if rn not in rules:
+                errors.append("collection %s 引用了不存在的规则：%s" % (cid, rn))
+        for r in (c.get("repos") or []):
+            if repo_names and r not in repo_names:
+                warnings.append("collection %s 的 repos 里 `%s` 不在顶层 repos" % (cid, r))
+    for rname in rules:
+        if rname not in used_rules:
+            warnings.append("规则 %s 未被任何 collection 引用（不会出现在报告里）" % rname)
+    return errors, warnings
+
+
+_INIT_TEMPLATE = """# github-repo-monitor / rules.yaml  (由 `gh_monitor.py --init` 生成)
+# 结构：settings / repos / rules / collections
+# collection -> rules -> filters；一条规则内 filters 为 AND，规则之间为 OR。
+# 改完跑：python3 scripts/gh_monitor.py --validate
+
+settings:
+  name: github-repo-monitor
+  min_similarity: 0.75
+  dedup_similar: false
+  unmatched: context
+  members: []
+  member_roles: [OWNER, MEMBER, COLLABORATOR]
+  github_api_url: https://api.github.com
+  state: all
+
+repos:
+  - repo: owner/name
+    note: "要盯的仓库"
+    watch_commits: true
+    watch_issues: true
+    watch_releases: true
+    paths: []
+    authors: []
+    labels: []
+
+collections:
+  - id: alerts
+    name: 需要立刻处理
+    resolution: alert
+    rules: [security, breaking, release, hot]
+  - id: context
+    name: 了解即可
+    category: background
+    description: "背景信息，不紧急"
+    resolution: context
+    rules: [perf]
+    # repos: [owner/name]   # 可选：该集合只从这些仓库取条目
+
+rules:
+  security:
+    name: 安全相关
+    filters:
+      - title: "CVE|security|RCE|vulnerab|0day|exploit"
+      - label: "!wontfix"
+  breaking:
+    name: 破坏性变更
+    filters:
+      - title: "breaking|incompatible|deprecat|BREAKING CHANGE"
+  release:
+    name: 新版本发布
+    filters:
+      - type: release
+  hot:
+    name: 社区高热
+    filters:
+      - reactions: ">=5"
+      - created: "-90d"
+  perf:
+    name: 性能相关
+    filters:
+      - title: "benchmark|compaction|performance|latency|throughput"
+"""
+
+
+def _init_rules(path, force=False):
+    if os.path.isfile(path) and not force:
+        print("已存在：%s（用 --force 覆盖）" % path)
+        return 1
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(_INIT_TEMPLATE)
+    print("[written] %s" % path)
+    print("下一步：编辑其中的 repos / rules / collections，然后 `--validate` 校验。")
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="github-repo-monitor 声明式分诊引擎")
     ap.add_argument("--since", help="ISO 起点（默认用本地 state 游标）")
@@ -904,10 +1255,26 @@ def main(argv=None):
     ap.add_argument("--max-enrich", type=int, default=20, help="评论拉取上限（0=关闭）")
     ap.add_argument("--no-enrich", action="store_true", help="关闭评论拉取")
     ap.add_argument("--self-test", action="store_true", help="解析+引擎自测（零网络）")
+    ap.add_argument("--validate", action="store_true", help="只静态校验 rules.yaml，不采集")
+    ap.add_argument("--init", action="store_true", help="生成一份 rules.yaml 模板后退出")
+    ap.add_argument("--force", action="store_true", help="与 --init 搭配，覆盖已存在文件")
     args = ap.parse_args(argv)
 
     rules_path = args.rules or os.path.join(os.path.dirname(os.path.abspath(__file__)), "rules.yaml")
+    if args.init:
+        return _init_rules(rules_path, force=args.force)
     cfg = load_rules(rules_path)
+    if args.validate:
+        errs, warns = validate_config(cfg, rules_path)
+        for w in warns:
+            print("WARN: %s" % w)
+        for e in errs:
+            print("ERROR: %s" % e)
+        if errs:
+            print("validate: FAILED (%d errors, %d warnings)" % (len(errs), len(warns)))
+            return 1
+        print("validate: OK (%d warnings)" % len(warns))
+        return 0
 
     # API base 优先级：--api-url > GITHUB_API_URL > settings.github_api_url > 默认
     base = args.api_url or os.environ.get("GITHUB_API_URL", "").strip() or \
@@ -934,7 +1301,8 @@ def main(argv=None):
 
     objs, by_tier, errors = gather(cfg, cursor_dt, args.lookback_days,
                                    args.max_enrich, args.no_enrich)
-    enriched = sum(1 for o in objs if o.get("comment_data") is not None)
+    enriched = sum(1 for o in objs
+                   if o.get("comment_data") is not None or o.get("reviews") is not None)
     report, counts = build_report(now, cursor_dt, by_tier, errors, cfg, enriched)
 
     print(report)
